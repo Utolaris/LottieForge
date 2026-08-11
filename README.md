@@ -18,15 +18,17 @@
 
 运行时：
 
-- FFmpeg（WebM / MOV 编码）
+- FFmpeg 9.0+（WebM / MOV / WebP 编码，构建时需启用 `libwebp`）
 - gifski（GIF 编码）
-- img2webp（WebP 编码，Homebrew `webp` 公式提供）
+
+可用 `ffmpeg -hide_banner -encoders | grep libwebp_anim` 确认 FFmpeg
+包含动画 WebP 编码器。
 
 构建时：
 
-- Rust（stable，含 `i686-pc-windows-gnu` target）
+- Rust（stable，含 `x86_64-pc-windows-gnu` target）
 - CMake 与 git（rlottie-sys 构建 vendored rlottie）
-- zig（Windows x86 交叉编译）
+- zig（Windows x86-64 交叉编译）
 - llvm-ar 或 mingw-w64（归档器；zig 0.16 的 `zig ar` 有缺陷时的替代）
 
 ## 构建
@@ -66,7 +68,7 @@ tgs-convert telegram-download https://t.me/addstickers/SomePack --output-dir ./p
 
 ## 说明
 
-- WebP 计时按帧显式写入毫秒延迟（60 FPS 使用 16/17/17ms 循环，总时长精确），不复用原 C# 项目的错误计时器。
+- WebP 由 FFmpeg 的 `libwebp_anim` 编码；质量 100 使用无损模式、effort 75 与压缩级别 6，低于 100 使用对应数值的有损质量、`yuva420p` 与压缩级别 5，以避开 `libwebp_anim` 在级别 6 的严重性能退化，均保留 alpha。FFmpeg 可合并相邻相同帧，CLI 会校正末帧最多 1ms 的取整差，使总时长与帧数/帧率对应的毫秒时间线一致。
 - GIF 帧延迟以 10ms 为单位，因此帧率被限制在 50 FPS 以内且必须能整除 1000ms。
 - Telegram bot token 不再内嵌进二进制，改从操作系统凭据库读取：
   - macOS：系统钥匙串（Keychain）。存入方式：
@@ -78,7 +80,7 @@ tgs-convert telegram-download https://t.me/addstickers/SomePack --output-dir ./p
 
 ## CI
 
-`.github/workflows/ci.yml` 在 macOS runner 上用 zig 交叉编译 x86 二进制，并在 Windows runner 上安装 FFmpeg 后实际执行转换验证。
+`.github/workflows/ci.yml` 在 macOS runner 上用 zig 交叉编译 x86-64 二进制，并在 Windows runner 上安装 FFmpeg 后实际执行 WebM、MOV 与 WebP 转换验证。
 
 ## 下载
 

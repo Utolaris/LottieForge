@@ -1,5 +1,6 @@
 use std::{
-    io::{BufRead, BufReader},
+    fs::OpenOptions,
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::Path,
     process::{Command, Stdio},
     sync::{
@@ -34,13 +35,10 @@ pub fn encode(
             cancel,
         );
     }
-    if options.output_format == OutputFormat::Webp {
-        return encode_webp(frames_directory, options, frame_count, output, cancel);
-    }
-
     let duration_seconds = frame_count as f64 / f64::from(options.fps);
+    let expected_webp_duration_ms = (frame_count as u64 * 1_000) / u64::from(options.fps);
     let fps = options.fps.to_string();
-    let frame_count = frame_count.to_string();
+    let frame_count_argument = frame_count.to_string();
     let threads = options.threads.to_string();
     let mut arguments = vec![
         "-hide_banner".to_owned(),
@@ -50,7 +48,7 @@ pub fn encode(
         "-i".to_owned(),
         "%05d.png".to_owned(),
         "-frames:v".to_owned(),
-        frame_count,
+        frame_count_argument,
     ];
 
     let progress_name = match options.output_format {
@@ -106,7 +104,8 @@ pub fn encode(
             "ProRes 4444 alpha MOV"
         }
         OutputFormat::Webp => {
-            unreachable!("WebP is encoded by img2webp before FFmpeg arguments are built")
+            append_webp_arguments(&mut arguments, options.quality, &threads);
+            "animated WebP"
         }
         OutputFormat::Gif => {
             unreachable!("GIF is encoded by gifski before FFmpeg arguments are built")
@@ -171,49 +170,149 @@ pub fn encode(
     if !status.success() {
         bail!("ffmpeg exited with {status}");
     }
+    if options.output_format == OutputFormat::Webp {
+        normalize_webp_duration(output, expected_webp_duration_ms)?;
+    }
     Ok(())
 }
 
-fn encode_webp(
-    frames_directory: &Path,
-    options: &ConvertOptions,
-    frame_count: usize,
-    output: &Path,
-    cancel: Arc<AtomicBool>,
-) -> Result<()> {
-    let quality = options.quality.max(1).to_string();
-    let mut command = Command::new("img2webp");
-    command
-        .current_dir(frames_directory)
-        .args(["-loop", "0", "-min_size"]);
-    for frame in 0..frame_count {
-        let duration = webp_frame_duration_ms(frame, options.fps).to_string();
-        command.args(["-d", &duration]);
-        if options.quality == 100 {
-            command.args(["-lossless", "-exact", "-m", "6"]);
-        } else {
-            command.args(["-lossy", "-exact", "-q", &quality, "-m", "6"]);
+fn append_webp_arguments(arguments: &mut Vec<String>, quality: u8, threads: &str) {
+    let lossless = quality == 100;
+    let encoder_quality = if lossless { 75 } else { quality };
+    let compression_level = if lossless { 6 } else { 5 };
+    let pixel_format = if lossless { "bgra" } else { "yuva420p" };
+    arguments.extend([
+        "-c:v".to_owned(),
+        "libwebp_anim".to_owned(),
+        "-lossless".to_owned(),
+        u8::from(lossless).to_string(),
+        "-compression_level".to_owned(),
+        compression_level.to_string(),
+        "-quality".to_owned(),
+        encoder_quality.to_string(),
+        "-pix_fmt".to_owned(),
+        pixel_format.to_owned(),
+        "-fps_mode".to_owned(),
+        "passthrough".to_owned(),
+        "-threads".to_owned(),
+        threads.to_owned(),
+        "-loop".to_owned(),
+        "0".to_owned(),
+        "-f".to_owned(),
+        "webp".to_owned(),
+    ]);
+}
+
+fn normalize_webp_duration(output: &Path, expected_duration_ms: u64) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(output)
+        .with_context(|| {
+            format!(
+                "failed to open {} for WebP timing verification",
+                output.display()
+            )
+        })?;
+    let file_length = file.metadata()?.len();
+    let mut riff_header = [0_u8; 12];
+    file.read_exact(&mut riff_header)
+        .with_context(|| format!("failed to read WebP header from {}", output.display()))?;
+    if &riff_header[..4] != b"RIFF" || &riff_header[8..] != b"WEBP" {
+        bail!(
+            "FFmpeg output is not a RIFF WebP file: {}",
+            output.display()
+        );
+    }
+
+    let riff_end = u64::from(u32::from_le_bytes(
+        riff_header[4..8]
+            .try_into()
+            .expect("RIFF size is four bytes"),
+    )) + 8;
+    if riff_end > file_length || riff_end < 12 {
+        bail!(
+            "FFmpeg produced a truncated WebP file: {}",
+            output.display()
+        );
+    }
+
+    let mut offset = 12_u64;
+    let mut total_duration_ms = 0_u64;
+    let mut last_duration = None;
+    while offset < riff_end {
+        if riff_end - offset < 8 {
+            bail!(
+                "FFmpeg produced a malformed WebP chunk table: {}",
+                output.display()
+            );
         }
-        command.arg(format!("{frame:05}.png"));
-    }
-    command.args(["-o"]).arg(output);
+        file.seek(SeekFrom::Start(offset))?;
+        let mut chunk_header = [0_u8; 8];
+        file.read_exact(&mut chunk_header)?;
+        let chunk_length = u64::from(u32::from_le_bytes(
+            chunk_header[4..]
+                .try_into()
+                .expect("chunk size is four bytes"),
+        ));
+        let payload_offset = offset + 8;
+        let padded_length = chunk_length
+            .checked_add(chunk_length % 2)
+            .context("WebP chunk length overflow")?;
+        let next_offset = payload_offset
+            .checked_add(padded_length)
+            .context("WebP chunk offset overflow")?;
+        if next_offset > riff_end {
+            bail!(
+                "FFmpeg produced a truncated WebP chunk: {}",
+                output.display()
+            );
+        }
 
-    let mut child = command
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("failed to start img2webp; install Homebrew webp or make it available on PATH")?;
-    let status = wait_for_child(&mut child, cancel, "img2webp")?;
-    if !status.success() {
-        bail!("img2webp exited with {status}");
+        if &chunk_header[..4] == b"ANMF" {
+            if chunk_length < 16 {
+                bail!(
+                    "FFmpeg produced a malformed WebP animation frame: {}",
+                    output.display()
+                );
+            }
+            let duration_offset = payload_offset + 12;
+            file.seek(SeekFrom::Start(duration_offset))?;
+            let mut duration_bytes = [0_u8; 3];
+            file.read_exact(&mut duration_bytes)?;
+            let duration_ms = u32::from(duration_bytes[0])
+                | (u32::from(duration_bytes[1]) << 8)
+                | (u32::from(duration_bytes[2]) << 16);
+            total_duration_ms += u64::from(duration_ms);
+            last_duration = Some((duration_offset, duration_ms));
+        }
+        offset = next_offset;
     }
+
+    let Some((last_duration_offset, last_duration_ms)) = last_duration else {
+        bail!(
+            "FFmpeg output has no WebP animation frames: {}",
+            output.display()
+        );
+    };
+    let correction = i128::from(expected_duration_ms) - i128::from(total_duration_ms);
+    if correction == 0 {
+        return Ok(());
+    }
+    if correction.abs() > 1 {
+        bail!(
+            "FFmpeg produced a WebP duration of {total_duration_ms}ms; expected {expected_duration_ms}ms"
+        );
+    }
+
+    let corrected_duration = i128::from(last_duration_ms) + correction;
+    if !(0..=0xFF_FFFF).contains(&corrected_duration) {
+        bail!("corrected WebP frame duration is out of range");
+    }
+    let corrected_bytes = (corrected_duration as u32).to_le_bytes();
+    file.seek(SeekFrom::Start(last_duration_offset))?;
+    file.write_all(&corrected_bytes[..3])?;
     Ok(())
-}
-
-fn webp_frame_duration_ms(frame: usize, fps: u32) -> u32 {
-    let frame = frame as u64;
-    let fps = u64::from(fps);
-    (((frame + 1) * 1_000 / fps) - (frame * 1_000 / fps)) as u32
 }
 
 fn encode_gif(
@@ -285,14 +384,82 @@ fn wait_for_child(
 
 #[cfg(test)]
 mod tests {
-    use super::webp_frame_duration_ms;
+    use std::fs;
+
+    use super::{append_webp_arguments, normalize_webp_duration};
 
     #[test]
-    fn webp_sixty_fps_has_exact_total_duration() {
-        let durations = (0..180)
-            .map(|frame| webp_frame_duration_ms(frame, 60))
-            .collect::<Vec<_>>();
-        assert!(durations.iter().all(|duration| matches!(duration, 16 | 17)));
-        assert_eq!(durations.iter().sum::<u32>(), 3_000);
+    fn webp_uses_ffmpeg_animation_encoder_in_lossless_mode_at_quality_100() {
+        let mut arguments = Vec::new();
+        append_webp_arguments(&mut arguments, 100, "8");
+
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["-c:v", "libwebp_anim"])
+        );
+        assert!(arguments.windows(2).any(|pair| pair == ["-lossless", "1"]));
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["-compression_level", "6"])
+        );
+        assert!(arguments.windows(2).any(|pair| pair == ["-quality", "75"]));
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["-pix_fmt", "bgra"])
+        );
+        assert!(arguments.windows(2).any(|pair| pair == ["-loop", "0"]));
+        assert!(arguments.windows(2).any(|pair| pair == ["-f", "webp"]));
+    }
+
+    #[test]
+    fn webp_uses_requested_lossy_quality_and_yuva_pixel_format() {
+        let mut arguments = Vec::new();
+        append_webp_arguments(&mut arguments, 0, "2");
+
+        assert!(arguments.windows(2).any(|pair| pair == ["-lossless", "0"]));
+        assert!(arguments.windows(2).any(|pair| pair == ["-quality", "0"]));
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["-compression_level", "5"])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["-pix_fmt", "yuva420p"])
+        );
+
+        let mut quality_one_arguments = Vec::new();
+        append_webp_arguments(&mut quality_one_arguments, 1, "2");
+        assert!(
+            quality_one_arguments
+                .windows(2)
+                .any(|pair| pair == ["-quality", "1"])
+        );
+    }
+
+    #[test]
+    fn webp_duration_normalization_corrects_the_last_frame_by_one_millisecond() {
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        let mut body = b"WEBP".to_vec();
+        for duration in [16_u32, 17, 16] {
+            body.extend_from_slice(b"ANMF");
+            body.extend_from_slice(&16_u32.to_le_bytes());
+            let mut payload = [0_u8; 16];
+            payload[12..15].copy_from_slice(&duration.to_le_bytes()[..3]);
+            body.extend_from_slice(&payload);
+        }
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        webp.extend_from_slice(&body);
+        fs::write(temporary.path(), webp).unwrap();
+
+        normalize_webp_duration(temporary.path(), 50).unwrap();
+
+        let corrected = fs::read(temporary.path()).unwrap();
+        assert_eq!(&corrected[80..83], &[17, 0, 0]);
     }
 }
