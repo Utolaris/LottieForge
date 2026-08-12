@@ -71,7 +71,7 @@ jobs:
             throw "FFmpeg 9 (full build) is required; found: $versionLine"
           }
           $encoders = ffmpeg -hide_banner -encoders 2>&1
-          if ($encoders -notmatch "libwebp_anim") { throw "ffmpeg does not provide libwebp_anim" }
+          if (-not ($encoders -match "libwebp_anim")) { throw "ffmpeg does not provide libwebp_anim" }
 
       - name: Create test TGS from Lottie fixture
         shell: pwsh
