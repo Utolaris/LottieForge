@@ -59,8 +59,8 @@ jobs:
           name: tgs-convert-x64
           path: bin
 
-      - name: Install ffmpeg
-        run: choco install ffmpeg -y --no-progress
+      - name: Install ffmpeg (gyan.dev full build with libwebp)
+        run: choco install ffmpeg-full -y --no-progress
 
       - name: Verify FFmpeg 9 full build with animated WebP encoder
         shell: pwsh
