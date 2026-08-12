@@ -9,7 +9,7 @@
   - WebM（VP9 + alpha，`tgs-convert`，默认命令）
   - MOV（Apple ProRes 4444 + alpha，`tgs-convert mov`）
   - WebP（动画无损 + alpha，`tgs-convert webp`）
-  - GIF（gifski，仅支持 1/2/4/5/10/20/25/50 FPS，`tgs-convert gif`）
+  - GIF（FFmpeg 编码器，仅支持 1/2/4/5/10/20/25/50 FPS，`tgs-convert gif`）
 - Telegram 贴纸包下载（`tgs-convert telegram-download`，支持 `t.me/addstickers` 与 `t.me/addemoji`）
 - 并行渲染：多个独立 rlottie worker 分帧渲染，帧序列写入临时目录
 - 参数：`--fps`（GIF 上限 50）、`--quality`、`--width/--height`、`--play-speed`、`--rotation`、`--flip-horizontal/--flip-vertical`、`--threads`、`--ffmpeg`
@@ -18,8 +18,15 @@
 
 运行时：
 
-- FFmpeg 9.0+（WebM / MOV / WebP 编码，构建时需启用 `libwebp`）
-- gifski（GIF 编码）
+- FFmpeg 9（必须为包含 `libwebp` 的 full 构建；WebM / MOV / WebP / GIF 编码）
+
+Homebrew 的普通 `ffmpeg` formula 不包含 libwebp，必须安装 `ffmpeg-full`
+并把它的 keg-only bin 目录加入 PATH：
+
+```sh
+brew install ffmpeg-full
+export PATH="/opt/homebrew/opt/ffmpeg-full/bin:$PATH"
+```
 
 可用 `ffmpeg -hide_banner -encoders | grep libwebp_anim` 确认 FFmpeg
 包含动画 WebP 编码器。
@@ -80,7 +87,7 @@ tgs-convert telegram-download https://t.me/addstickers/SomePack --output-dir ./p
 
 ## CI
 
-`.github/workflows/ci.yml` 在 macOS runner 上用 zig 交叉编译 x86-64 二进制，并在 Windows runner 上安装 FFmpeg 后实际执行 WebM、MOV 与 WebP 转换验证。
+`.github/workflows/ci.yml` 在 macOS runner 上用 zig 交叉编译 x86-64 二进制，并在 Windows runner 上安装 FFmpeg 后实际执行 WebM、MOV、WebP 与 GIF 转换验证。
 
 ## 下载
 

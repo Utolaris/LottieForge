@@ -96,7 +96,7 @@ struct WebpCli {
 #[command(
     name = "tgs-convert gif",
     version,
-    about = "Parallel TGS/Lottie JSON to animated GIF converter using gifski"
+    about = "Parallel TGS/Lottie JSON to animated GIF converter (FFmpeg palettegen/paletteuse)"
 )]
 struct GifCli {
     #[command(flatten)]

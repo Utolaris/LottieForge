@@ -19,21 +19,11 @@ pub fn encode(
     frames_directory: &Path,
     options: &ConvertOptions,
     frame_count: usize,
-    width: usize,
-    height: usize,
     output: &Path,
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
     if options.output_format == OutputFormat::Gif {
-        return encode_gif(
-            frames_directory,
-            options,
-            frame_count,
-            width,
-            height,
-            output,
-            cancel,
-        );
+        return encode_gif(frames_directory, options, frame_count, output, cancel);
     }
     let duration_seconds = frame_count as f64 / f64::from(options.fps);
     let expected_webp_duration_ms = (frame_count as u64 * 1_000) / u64::from(options.fps);
@@ -108,7 +98,7 @@ pub fn encode(
             "animated WebP"
         }
         OutputFormat::Gif => {
-            unreachable!("GIF is encoded by gifski before FFmpeg arguments are built")
+            unreachable!("GIF is encoded by encode_gif before FFmpeg arguments are built")
         }
     };
     arguments.extend([
@@ -319,47 +309,49 @@ fn encode_gif(
     frames_directory: &Path,
     options: &ConvertOptions,
     frame_count: usize,
-    width: usize,
-    height: usize,
     output: &Path,
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
-    let fps = options.fps.to_string();
-    let quality = options.quality.max(1).to_string();
-    let width = width.to_string();
-    let height = height.to_string();
-    let mut command = Command::new("gifski");
-    command
+    let mut arguments = vec![
+        "-hide_banner".to_owned(),
+        "-y".to_owned(),
+        "-framerate".to_owned(),
+        options.fps.to_string(),
+        "-i".to_owned(),
+        "%05d.png".to_owned(),
+        "-frames:v".to_owned(),
+        frame_count.to_string(),
+    ];
+    append_gif_arguments(&mut arguments, options.quality);
+    let mut child = Command::new(&options.ffmpeg)
         .current_dir(frames_directory)
-        .args([
-            "--fps",
-            &fps,
-            "--quality",
-            &quality,
-            "--repeat",
-            "0",
-            "--width",
-            &width,
-            "--height",
-            &height,
-            "--no-sort",
-            "--output",
-        ])
-        .arg(output);
-    for frame in 0..frame_count {
-        command.arg(format!("{frame:05}.png"));
-    }
-
-    let mut child = command
+        .args(&arguments)
+        .arg(output)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("failed to start gifski; install it or make it available on PATH")?;
-    let status = wait_for_child(&mut child, cancel, "gifski")?;
+        .with_context(|| format!("failed to start {}", options.ffmpeg.display()))?;
+    let status = wait_for_child(&mut child, cancel, "ffmpeg")?;
     if !status.success() {
-        bail!("gifski exited with {status}");
+        bail!("ffmpeg exited with {status}");
     }
     Ok(())
+}
+
+fn append_gif_arguments(arguments: &mut Vec<String>, quality: u8) {
+    let max_colors = gif_max_colors(quality);
+    arguments.extend([
+        "-filter_complex".to_owned(),
+        format!(
+            "[0:v]split[s0][s1];[s0]palettegen=max_colors={max_colors}:stats_mode=diff[p];[s1][p]paletteuse=alpha_threshold=128"
+        ),
+        "-loop".to_owned(),
+        "0".to_owned(),
+    ]);
+}
+
+fn gif_max_colors(quality: u8) -> u16 {
+    u16::from(quality) * 224 / 100 + 32
 }
 
 fn wait_for_child(
@@ -386,7 +378,9 @@ fn wait_for_child(
 mod tests {
     use std::fs;
 
-    use super::{append_webp_arguments, normalize_webp_duration};
+    use super::{
+        append_gif_arguments, append_webp_arguments, gif_max_colors, normalize_webp_duration,
+    };
 
     #[test]
     fn webp_uses_ffmpeg_animation_encoder_in_lossless_mode_at_quality_100() {
@@ -461,5 +455,28 @@ mod tests {
 
         let corrected = fs::read(temporary.path()).unwrap();
         assert_eq!(&corrected[80..83], &[17, 0, 0]);
+    }
+
+    #[test]
+    fn gif_uses_palettegen_paletteuse_with_transparency_and_infinite_loop() {
+        let mut arguments = Vec::new();
+        append_gif_arguments(&mut arguments, 100);
+
+        let filter = arguments
+            .windows(2)
+            .find(|pair| pair[0] == "-filter_complex")
+            .map(|pair| pair[1].as_str())
+            .expect("filter_complex argument is present");
+        assert!(filter.contains("palettegen=max_colors=256"));
+        assert!(filter.contains("stats_mode=diff"));
+        assert!(filter.contains("paletteuse=alpha_threshold=128"));
+        assert!(arguments.windows(2).any(|pair| pair == ["-loop", "0"]));
+    }
+
+    #[test]
+    fn gif_max_colors_maps_quality_across_the_gif_palette() {
+        assert_eq!(gif_max_colors(0), 32);
+        assert_eq!(gif_max_colors(50), 144);
+        assert_eq!(gif_max_colors(100), 256);
     }
 }

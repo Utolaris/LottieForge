@@ -7,11 +7,13 @@ animated GIF. It replaces the desktop project's TGS-to-WebM chain:
 1. decompress a TGS when required;
 2. render transparent RGBA PNG frames with vendored rlottie;
 3. encode with FFmpeg libvpx-vp9/yuva420p, prores_ks/yuva444p10le, or
-   libwebp_anim, or with gifski.
+   libwebp_anim, or with the palettegen/paletteuse GIF pipeline.
 
-It does not depend on .NET, Avalonia, Python, or a GUI. FFmpeg 9.0 or newer,
-built with libwebp support, is an explicit runtime dependency for WebM, MOV,
-and WebP output. Verify animated WebP support with:
+It does not depend on .NET, Avalonia, Python, or a GUI. FFmpeg 9 in a full
+build with libwebp support is an explicit runtime dependency for WebM, MOV,
+WebP, and GIF output. Homebrew's regular ffmpeg formula omits libwebp, so
+install ffmpeg-full instead and put its keg-only bin directory on PATH
+(`brew install ffmpeg-full`). Verify animated WebP support with:
 
     ffmpeg -hide_banner -encoders | grep libwebp_anim
 
@@ -53,7 +55,7 @@ The input may be .tgs, plain Lottie JSON, or gzip-compressed JSON. When
 | Playback speed | --play-speed 0.1..10 | 1.0 |
 | Rotation | --rotation | 0 |
 | Horizontal / vertical flip | --flip-horizontal, --flip-vertical | off |
-| FFmpeg location (WebM, MOV, WebP) | --ffmpeg | ffmpeg |
+| FFmpeg location (WebM, MOV, WebP, GIF) | --ffmpeg | ffmpeg |
 
 Quality uses the same mappings as WebmConverter: quality 100 selects VP9 CRF
 15 and cpu-used 0. VP9 output uses yuva420p, the four-plane format required to
@@ -100,7 +102,8 @@ indefinitely.
 
 ## Animated GIF
 
-Use the gif subcommand to encode the same RGBA frame sequence through gifski:
+Use the gif subcommand to encode the same RGBA frame sequence with FFmpeg's
+palettegen/paletteuse pipeline:
 
     ./target/release/tgs-convert gif ../测试.tgs \
       --output ../测试.gif \
@@ -111,7 +114,9 @@ Use the gif subcommand to encode the same RGBA frame sequence through gifski:
 GIF frame delays are stored in 10ms units. Therefore GIF accepts only 1, 2, 4,
 5, 10, 20, 25, or 50 FPS; 50 FPS is the default and maximum. GIF supports one
 transparent palette entry, so fully transparent pixels remain transparent but
-semi-transparent edges are quantized to binary transparency by the format.
+semi-transparent edges are quantized to binary transparency by the format
+(paletteuse alpha_threshold 128). --quality maps to the GIF palette size
+(32..256 colors via palettegen max_colors).
 
 ## Frame sampling note
 
