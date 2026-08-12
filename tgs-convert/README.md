@@ -6,11 +6,16 @@ animated GIF. It replaces the desktop project's TGS-to-WebM chain:
 
 1. decompress a TGS when required;
 2. render transparent RGBA PNG frames with vendored rlottie;
-3. encode with FFmpeg libvpx-vp9/yuva420p or prores_ks/yuva444p10le, img2webp,
-   or gifski.
+3. encode with FFmpeg libvpx-vp9/yuva420p, prores_ks/yuva444p10le, or
+   libwebp_anim, or with the palettegen/paletteuse GIF pipeline.
 
-It does not depend on .NET, Avalonia, Python, or a GUI. FFmpeg remains an
-explicit runtime dependency.
+It does not depend on .NET, Avalonia, Python, or a GUI. FFmpeg 9 in a full
+build with libwebp support is an explicit runtime dependency for WebM, MOV,
+WebP, and GIF output. Homebrew's regular ffmpeg formula omits libwebp, so
+install ffmpeg-full instead and put its keg-only bin directory on PATH
+(`brew install ffmpeg-full`). Verify animated WebP support with:
+
+    ffmpeg -hide_banner -encoders | grep libwebp_anim
 
 ## Build
 
@@ -50,11 +55,11 @@ The input may be .tgs, plain Lottie JSON, or gzip-compressed JSON. When
 | Playback speed | --play-speed 0.1..10 | 1.0 |
 | Rotation | --rotation | 0 |
 | Horizontal / vertical flip | --flip-horizontal, --flip-vertical | off |
-| FFmpeg location | --ffmpeg | ffmpeg |
+| FFmpeg location (WebM, MOV, WebP, GIF) | --ffmpeg | ffmpeg |
 
 Quality uses the same mappings as WebmConverter: quality 100 selects VP9 CRF
-15 and cpu-used 0. Every output uses yuva420p; that is the four-plane format
-required to preserve transparency.
+15 and cpu-used 0. VP9 output uses yuva420p, the four-plane format required to
+preserve transparency.
 
 ## ProRes 4444 MOV
 
@@ -83,15 +88,22 @@ Use the webp subcommand to produce a lossless looping animated WebP with alpha:
       --quality 100 \
       --threads 8
 
-WebP is encoded from the RGBA PNG sequence with img2webp, so semi-transparent
-pixels remain transparent. Every frame receives an explicit integer-millisecond
-duration. At 60 FPS, the CLI uses a 16/17/17ms repeating schedule whose total
-duration is exact, rather than using the desktop project's defective WebP timer.
-The Homebrew webp formula provides img2webp.
+WebP is encoded from the RGBA PNG sequence by the selected FFmpeg executable's
+libwebp_anim encoder, so semi-transparent pixels remain transparent. Quality
+100 selects lossless mode with effort 75 and compression level 6, matching the
+former img2webp behavior. Lower values select lossy mode at the requested
+quality, use `yuva420p`, and cap compression at level 5 to avoid libwebp_anim's
+severe level-6 performance cliff. FFmpeg may coalesce
+adjacent identical frames. After encoding, the CLI verifies the WebP frame
+durations and corrects at most one millisecond on the final frame so the total
+duration matches the integer-millisecond `frame_count / fps` timeline, instead
+of using the desktop project's defective WebP timer. The output loops
+indefinitely.
 
 ## Animated GIF
 
-Use the gif subcommand to encode the same RGBA frame sequence through gifski:
+Use the gif subcommand to encode the same RGBA frame sequence with FFmpeg's
+palettegen/paletteuse pipeline:
 
     ./target/release/tgs-convert gif ../测试.tgs \
       --output ../测试.gif \
@@ -102,7 +114,9 @@ Use the gif subcommand to encode the same RGBA frame sequence through gifski:
 GIF frame delays are stored in 10ms units. Therefore GIF accepts only 1, 2, 4,
 5, 10, 20, 25, or 50 FPS; 50 FPS is the default and maximum. GIF supports one
 transparent palette entry, so fully transparent pixels remain transparent but
-semi-transparent edges are quantized to binary transparency by the format.
+semi-transparent edges are quantized to binary transparency by the format
+(paletteuse alpha_threshold 128). --quality maps to the GIF palette size
+(32..256 colors via palettegen max_colors).
 
 ## Frame sampling note
 

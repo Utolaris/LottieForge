@@ -3,7 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const zig_exe = b.graph.zig_exe;
 
-    const win_x86 = b.step("win-x86", "Cross-compile tgs-convert.exe (Windows x86) with zig");
+    const win_x64 = b.step("win-x64", "Cross-compile tgs-convert.exe (Windows x64) with zig");
 
     const toolchain = toolchain_dir();
     const setup = setup_toolchain(b, zig_exe, toolchain);
@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
     }
     cargo.step.dependOn(&rustup.step);
     cargo.step.dependOn(&setup.step);
-    win_x86.dependOn(&cargo.step);
+    win_x64.dependOn(&cargo.step);
 
     const install = b.addInstallFileWithDir(
         b.path("tgs-convert/target/x86_64-pc-windows-gnu/release/tgs-convert.exe"),
@@ -38,7 +38,7 @@ pub fn build(b: *std.Build) void {
     );
     install.step.dependOn(&cargo.step);
     b.getInstallStep().dependOn(&install.step);
-    win_x86.dependOn(&install.step);
+    win_x64.dependOn(&install.step);
 
     const mac = b.step("mac", "Build the native macOS binary");
     const cargo_mac = b.addSystemCommand(&.{ "cargo", "build", "--release" });
@@ -155,7 +155,7 @@ fn setup_toolchain(b: *std.Build, zig_exe: []const u8, dir: []const u8) *std.Bui
         \\fi
         \\exec "$real_cmake" \
         \\  -DCMAKE_SYSTEM_NAME=Windows \
-        \\  -DCMAKE_SYSTEM_PROCESSOR=x86 \
+        \\  -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
         \\  -DCMAKE_C_COMPILER="$here/cc.sh" \
         \\  -DCMAKE_CXX_COMPILER="$here/cxx.sh" \
         \\  -DCMAKE_AR="$here/ar.sh" \

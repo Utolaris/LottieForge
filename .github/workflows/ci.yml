@@ -9,8 +9,8 @@ on:
     types: [published]
 
 jobs:
-  build-x86:
-    name: Build Windows x86 binary with zig
+  build-x64:
+    name: Build Windows x64 binary with zig
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,7 +18,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: i686-pc-windows-gnu
+          targets: x86_64-pc-windows-gnu
 
       - name: Install zig
         shell: bash
@@ -41,26 +41,37 @@ jobs:
       - name: Cross-compile tgs-convert.exe
         run: zig build
 
-      - name: Upload x86 binary
+      - name: Upload x64 binary
         uses: actions/upload-artifact@v4
         with:
-          name: tgs-convert-x86
+          name: tgs-convert-x64
           path: tgs-convert/target/x86_64-pc-windows-gnu/release/tgs-convert.exe
 
-  test-x86:
-    name: Test Windows x86 binary on Windows
+  test-x64:
+    name: Test Windows x64 binary on Windows
     runs-on: windows-latest
-    needs: build-x86
+    needs: build-x64
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
-          name: tgs-convert-x86
+          name: tgs-convert-x64
           path: bin
 
-      - name: Install ffmpeg
-        run: choco install ffmpeg -y --no-progress
+      - name: Install ffmpeg (gyan.dev full build with libwebp)
+        run: choco install ffmpeg-full -y --no-progress
+
+      - name: Verify FFmpeg 9 full build with animated WebP encoder
+        shell: pwsh
+        run: |
+          $versionLine = ffmpeg -version | Select-Object -First 1
+          $version = [regex]::Match($versionLine, '^ffmpeg version (\d+)')
+          if (-not $version.Success -or [int]$version.Groups[1].Value -ne 9) {
+            throw "FFmpeg 9 (full build) is required; found: $versionLine"
+          }
+          $encoders = ffmpeg -hide_banner -encoders 2>&1
+          if (-not ($encoders -match "libwebp_anim")) { throw "ffmpeg does not provide libwebp_anim" }
 
       - name: Create test TGS from Lottie fixture
         shell: pwsh
@@ -97,3 +108,25 @@ jobs:
           $size = (Get-Item out.mov).Length
           Write-Host "out.mov size=$size"
           if ($size -lt 1000) { throw "out.mov too small: $size" }
+
+      - name: Convert TGS to animated WebP
+        run: .\bin\tgs-convert.exe webp sample.tgs --output out.webp --fps 5 --quality 75 --threads 2
+
+      - name: Verify WebP output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path out.webp)) { throw "out.webp was not created" }
+          $size = (Get-Item out.webp).Length
+          Write-Host "out.webp size=$size"
+          if ($size -lt 1000) { throw "out.webp too small: $size" }
+
+      - name: Convert TGS to animated GIF
+        run: .\bin\tgs-convert.exe gif sample.tgs --output out.gif --fps 5 --quality 100 --threads 2
+
+      - name: Verify GIF output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path out.gif)) { throw "out.gif was not created" }
+          $size = (Get-Item out.gif).Length
+          Write-Host "out.gif size=$size"
+          if ($size -lt 1000) { throw "out.gif too small: $size" }

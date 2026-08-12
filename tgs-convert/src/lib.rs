@@ -83,8 +83,6 @@ pub fn convert(options: &ConvertOptions) -> Result<ConversionReport> {
         temporary_directory.path(),
         options,
         frames,
-        width,
-        height,
         &absolute_output,
         Arc::clone(&cancel),
     )?;

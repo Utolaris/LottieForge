@@ -65,7 +65,7 @@ struct ConversionArgs {
     #[arg(long, default_value_t = default_threads())]
     threads: usize,
 
-    /// FFmpeg executable path or command name (used by WebM and MOV output).
+    /// FFmpeg executable path or command name (used by WebM, MOV, WebP, and GIF output).
     #[arg(long, default_value = "ffmpeg")]
     ffmpeg: PathBuf,
 }
@@ -96,7 +96,7 @@ struct WebpCli {
 #[command(
     name = "tgs-convert gif",
     version,
-    about = "Parallel TGS/Lottie JSON to animated GIF converter using gifski"
+    about = "Parallel TGS/Lottie JSON to animated GIF converter (FFmpeg palettegen/paletteuse)"
 )]
 struct GifCli {
     #[command(flatten)]
