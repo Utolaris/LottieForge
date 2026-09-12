@@ -77,6 +77,28 @@ Usage: tgs-convert [OPTIONS] <INPUT>
 
 集成测试 `tests/cli.rs` 覆盖：5 个 `.tgs` 与 2 个 JSON 夹具全部可加载；gzip 与明文 JSON 解析结果一致；有 FFmpeg 时跑通 4 种格式并断言临时帧目录无残留。
 
+### 发布后新发现：rlottie 缓存键冲突（同进程第二次加载返回第一次的动画）
+
+v0.1.1 发布后 CI 的集成测试偶发失败：`gzip_compressed_lottie_loads_like_plain_json` 在 CI 上报 `left: 512, right: 256`，本地却稳定通过。追下去发现**不是测试抖动，而是 `load_animation` 的真实 bug**。
+
+```rust
+// render.rs（修复前）
+Animation::from_data(json.clone(), "tgs-convert-inspect", &resource_path)
+```
+
+rlottie 以该字符串为键维护**进程级**动画缓存，键重复时返回**首次**存入的动画，忽略本次传入的数据。实测：
+
+```
+先加载 AgADAQADwDZPEw.tgs  -> 512x512
+再加载 sample.lottie.json  -> 512x512   ← 实际应为 256x256
+```
+
+**影响面**：CLI 每次进程只转换一个文件，不受影响；但 `tgs_convert::convert()` 作为库 API 在同进程转换第二个文件时，会**静默产出第一个文件的动画**。测试进程里多个用例并发调用同一常量键，还会竞态访问该缓存条目——这正是 CI 偶发失败的成因（本地未触发纯属时序运气）。
+
+**修复**：`next_cache_key()` 用原子计数器给每次加载生成唯一键，`load_animation` 与 `new_renderer` 都改用它。新增回归测试 `loading_two_animations_in_one_process_returns_each_own_metadata`，直接断言 512 与 256——若再撞缓存必然失败。本地连跑 5 次全绿。
+
+这个 bug 在审计时没被发现，因为它是**跨调用的状态污染**，静态审视单个函数看不出来——只有在同进程加载两个不同动画时才暴露。已发布的 v0.1.1 二进制 CLI 行为不受影响，修复随下一个补丁版本发布。
+
 ### V1 端到端验证
 
 用等价最小程序复现过之后，又临时把 `API_BASE` 指向不可达主机、跑真实的 `telegram-download` 路径（事后已还原）：

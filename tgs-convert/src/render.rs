@@ -35,10 +35,23 @@ impl LoadedAnimation {
     /// internal animation cache by this string, so it has to be unique per
     /// worker.
     fn new_renderer(&self, worker_id: usize) -> Result<Animation> {
-        let cache_key = format!("tgs-convert-{}-{worker_id}", std::process::id());
+        let cache_key = next_cache_key(&format!("worker-{worker_id}"));
         Animation::from_data(self.json.to_vec(), cache_key, &self.resource_path)
             .ok_or_else(|| anyhow!("rlottie could not initialize renderer worker {worker_id}"))
     }
+}
+
+/// Builds a cache key that has never been used before in this process.
+///
+/// rlottie keeps a process-global animation cache keyed by this string: asking
+/// for a key it has already seen hands back the *first* animation stored under
+/// it, whatever data you pass this time. A constant key would therefore mean
+/// only one animation could ever be loaded per process, and concurrent loads
+/// would race over the same entry.
+fn next_cache_key(prefix: &str) -> String {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("tgs-convert-{prefix}-{}-{unique}", std::process::id())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -92,7 +105,7 @@ pub fn load_animation(input: &Path) -> Result<LoadedAnimation> {
     }
 
     let resource_path = crate::parent_directory(input).to_path_buf();
-    let animation = Animation::from_data(json.clone(), "tgs-convert-inspect", &resource_path)
+    let animation = Animation::from_data(json.clone(), next_cache_key("inspect"), &resource_path)
         .ok_or_else(|| anyhow!("rlottie could not load {}", input.display()))?;
     let size = animation.size();
     let duration_seconds = declared_duration_seconds(&json).unwrap_or_else(|| animation.duration());

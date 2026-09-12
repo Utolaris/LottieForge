@@ -64,6 +64,23 @@ fn every_json_fixture_loads() {
     }
 }
 
+/// rlottie hands back a cached animation when a cache key is reused, so a
+/// second load in the same process used to return the first animation's
+/// metadata. The CLI never notices (one conversion per process); callers of
+/// the library API definitely do.
+#[test]
+fn loading_two_animations_in_one_process_returns_each_own_metadata() {
+    let directory = fixture_directory();
+    let tgs = load_animation(&directory.join("AgADAQADwDZPEw.tgs")).expect("the TGS loads");
+    let json = load_animation(&directory.join("sample.lottie.json")).expect("the JSON loads");
+
+    assert_eq!(
+        tgs.metadata.width, 512,
+        "the bundled TGS fixtures are 512x512"
+    );
+    assert_eq!(json.metadata.width, 256, "sample.lottie.json is 256x256");
+}
+
 #[test]
 fn gzip_compressed_lottie_loads_like_plain_json() {
     let source = fixture_directory().join("sample.lottie.json");
