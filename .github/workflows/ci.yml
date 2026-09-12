@@ -101,20 +101,29 @@ jobs:
         run: cargo build --release
         working-directory: tgs-convert
 
+      # GitHub release assets do not preserve file permissions, so a bare
+      # binary would arrive without the executable bit. The tarball keeps it.
+      - name: Package the macOS binary
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name || 'main' }}
+        run: |
+          cp tgs-convert/target/release/tgs-convert tgs-convert
+          chmod +x tgs-convert
+          tar czf "tgs-convert-${TAG_NAME}-macos-arm64.tar.gz" tgs-convert
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: tgs-convert-macos-arm64
-          path: tgs-convert/target/release/tgs-convert
+          path: tgs-convert-*-macos-arm64.tar.gz
 
       - name: Attach the macOS binary to the GitHub release
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cp tgs-convert/target/release/tgs-convert tgs-convert-macos-arm64
           gh release upload "${{ github.event.release.tag_name }}" \
-            tgs-convert-macos-arm64 --clobber
+            tgs-convert-*-macos-arm64.tar.gz --clobber
 
   test-x64:
     name: Test Windows x64 binary on Windows
