@@ -105,11 +105,16 @@ jobs:
       # binary would arrive without the executable bit. The tarball keeps it.
       # The name mirrors the Windows asset: program name plus the
       # platform-appropriate container, with no version or platform tag.
+      #
+      # Stage the binary in its own directory: copying it to `tgs-convert`
+      # would land inside the crate directory of the same name, and the
+      # tarball would pick up that directory's build output too.
       - name: Package the macOS binary
         run: |
-          cp tgs-convert/target/release/tgs-convert tgs-convert
-          chmod +x tgs-convert
-          tar czf tgs-convert.tar.gz tgs-convert
+          mkdir -p staging
+          cp tgs-convert/target/release/tgs-convert staging/tgs-convert
+          chmod +x staging/tgs-convert
+          tar czf tgs-convert.tar.gz -C staging tgs-convert
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
