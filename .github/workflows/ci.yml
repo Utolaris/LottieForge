@@ -38,6 +38,8 @@ jobs:
   build-x64:
     name: Build Windows x64 binary with zig
     runs-on: macos-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v6
 
@@ -72,6 +74,47 @@ jobs:
         with:
           name: tgs-convert-x64
           path: tgs-convert/target/x86_64-pc-windows-gnu/release/tgs-convert.exe
+
+      - name: Attach the Windows binary to the GitHub release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            tgs-convert/target/x86_64-pc-windows-gnu/release/tgs-convert.exe --clobber
+
+  build-mac:
+    name: Build macOS Apple Silicon binary
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install rlottie build dependencies
+        run: brew install gcc cmake
+
+      - name: Build release binary
+        run: cargo build --release
+        working-directory: tgs-convert
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tgs-convert-macos-arm64
+          path: tgs-convert/target/release/tgs-convert
+
+      - name: Attach the macOS binary to the GitHub release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp tgs-convert/target/release/tgs-convert tgs-convert-macos-arm64
+          gh release upload "${{ github.event.release.tag_name }}" \
+            tgs-convert-macos-arm64 --clobber
 
   test-x64:
     name: Test Windows x64 binary on Windows
