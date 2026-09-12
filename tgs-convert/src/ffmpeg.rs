@@ -1,6 +1,5 @@
 use std::{
-    fs::OpenOptions,
-    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader},
     path::Path,
     process::{Command, Stdio},
     sync::{
@@ -13,113 +12,79 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use crate::options::{ConvertOptions, OutputFormat};
+use crate::formats::{EncodePlan, Progress, normalize_webp_duration};
 
+/// Runs the FFmpeg invocation a format asked for.
+///
+/// This module knows nothing about individual formats — that lives in
+/// `formats`. It only knows how to start FFmpeg, report progress and honour
+/// cancellation.
 pub fn encode(
     frames_directory: &Path,
-    options: &ConvertOptions,
-    frame_count: usize,
+    program: &Path,
+    plan: &EncodePlan,
     output: &Path,
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
-    if options.output_format == OutputFormat::Gif {
-        return encode_gif(frames_directory, options, frame_count, output, cancel);
+    match plan {
+        EncodePlan::Gif { arguments } => {
+            encode_gif(frames_directory, program, arguments, output, cancel)
+        }
+        EncodePlan::Single {
+            arguments,
+            progress,
+        } => encode_with_progress(
+            frames_directory,
+            program,
+            arguments,
+            progress,
+            output,
+            cancel,
+        ),
+        EncodePlan::Webp {
+            arguments,
+            progress,
+            expected_duration_ms,
+        } => {
+            encode_with_progress(
+                frames_directory,
+                program,
+                arguments,
+                progress,
+                output,
+                Arc::clone(&cancel),
+            )?;
+            normalize_webp_duration(output, *expected_duration_ms)
+        }
     }
-    let duration_seconds = frame_count as f64 / f64::from(options.fps);
-    let expected_webp_duration_ms = (frame_count as u64 * 1_000) / u64::from(options.fps);
-    let fps = options.fps.to_string();
-    let frame_count_argument = frame_count.to_string();
-    let threads = options.threads.to_string();
-    let mut arguments = vec![
-        "-hide_banner".to_owned(),
-        "-y".to_owned(),
-        "-framerate".to_owned(),
-        fps,
-        "-i".to_owned(),
-        "%05d.png".to_owned(),
-        "-frames:v".to_owned(),
-        frame_count_argument,
-    ];
+}
 
-    let progress_name = match options.output_format {
-        OutputFormat::WebmVp9 => {
-            let crf = options.vp9_crf().to_string();
-            let cpu_used = options.vp9_cpu_used().to_string();
-            arguments.extend([
-                "-c:v".to_owned(),
-                "libvpx-vp9".to_owned(),
-                "-crf".to_owned(),
-                crf,
-                "-b:v".to_owned(),
-                "0".to_owned(),
-                "-cpu-used".to_owned(),
-                cpu_used,
-                "-threads".to_owned(),
-                threads.clone(),
-                "-row-mt".to_owned(),
-                "1".to_owned(),
-                "-tile-columns".to_owned(),
-                "2".to_owned(),
-                "-tile-rows".to_owned(),
-                "1".to_owned(),
-                "-frame-parallel".to_owned(),
-                "1".to_owned(),
-                "-auto-alt-ref".to_owned(),
-                "1".to_owned(),
-                "-lag-in-frames".to_owned(),
-                "25".to_owned(),
-                "-pix_fmt".to_owned(),
-                "yuva420p".to_owned(),
-            ]);
-            "VP9 alpha WebM"
-        }
-        OutputFormat::MovProres4444 => {
-            let bits_per_mb = options.prores_bits_per_mb().to_string();
-            arguments.extend([
-                "-c:v".to_owned(),
-                "prores_ks".to_owned(),
-                "-profile:v".to_owned(),
-                "4".to_owned(),
-                "-bits_per_mb".to_owned(),
-                bits_per_mb,
-                "-alpha_bits".to_owned(),
-                "16".to_owned(),
-                "-threads".to_owned(),
-                threads.clone(),
-                "-pix_fmt".to_owned(),
-                "yuva444p10le".to_owned(),
-                "-movflags".to_owned(),
-                "+faststart".to_owned(),
-            ]);
-            "ProRes 4444 alpha MOV"
-        }
-        OutputFormat::Webp => {
-            append_webp_arguments(&mut arguments, options.quality, &threads);
-            "animated WebP"
-        }
-        OutputFormat::Gif => {
-            unreachable!("GIF is encoded by encode_gif before FFmpeg arguments are built")
-        }
-    };
-    arguments.extend([
+fn encode_with_progress(
+    frames_directory: &Path,
+    program: &Path,
+    arguments: &[String],
+    progress: &Progress,
+    output: &Path,
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut full_arguments = arguments.to_vec();
+    full_arguments.extend([
         "-progress".to_owned(),
         "pipe:1".to_owned(),
         "-nostats".to_owned(),
     ]);
-    let mut child = Command::new(&options.ffmpeg)
-        .current_dir(frames_directory)
-        .args(&arguments)
-        .arg(output)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| format!("failed to start {}", options.ffmpeg.display()))?;
 
-    let stdout = child
-        .stdout
-        .take()
-        .expect("ffmpeg stdout was configured as piped");
+    let mut child = spawn(
+        frames_directory,
+        program,
+        &full_arguments,
+        output,
+        Stdio::piped(),
+    )?;
+    let stdout = child.stdout.take().context("FFmpeg stdout was not piped")?;
     let progress_cancel = Arc::clone(&cancel);
+    let duration_seconds = progress.duration_seconds;
+    let progress_name = progress.label;
     let progress_reader = thread::spawn(move || {
         let reader = BufReader::new(stdout);
         let mut last_percent = 0_u8;
@@ -160,177 +125,23 @@ pub fn encode(
     if !status.success() {
         bail!("ffmpeg exited with {status}");
     }
-    if options.output_format == OutputFormat::Webp {
-        normalize_webp_duration(output, expected_webp_duration_ms)?;
-    }
-    Ok(())
-}
-
-fn append_webp_arguments(arguments: &mut Vec<String>, quality: u8, threads: &str) {
-    let lossless = quality == 100;
-    let encoder_quality = if lossless { 75 } else { quality };
-    let compression_level = if lossless { 6 } else { 5 };
-    let pixel_format = if lossless { "bgra" } else { "yuva420p" };
-    arguments.extend([
-        "-c:v".to_owned(),
-        "libwebp_anim".to_owned(),
-        "-lossless".to_owned(),
-        u8::from(lossless).to_string(),
-        "-compression_level".to_owned(),
-        compression_level.to_string(),
-        "-quality".to_owned(),
-        encoder_quality.to_string(),
-        "-pix_fmt".to_owned(),
-        pixel_format.to_owned(),
-        "-fps_mode".to_owned(),
-        "passthrough".to_owned(),
-        "-threads".to_owned(),
-        threads.to_owned(),
-        "-loop".to_owned(),
-        "0".to_owned(),
-        "-f".to_owned(),
-        "webp".to_owned(),
-    ]);
-}
-
-fn normalize_webp_duration(output: &Path, expected_duration_ms: u64) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(output)
-        .with_context(|| {
-            format!(
-                "failed to open {} for WebP timing verification",
-                output.display()
-            )
-        })?;
-    let file_length = file.metadata()?.len();
-    let mut riff_header = [0_u8; 12];
-    file.read_exact(&mut riff_header)
-        .with_context(|| format!("failed to read WebP header from {}", output.display()))?;
-    if &riff_header[..4] != b"RIFF" || &riff_header[8..] != b"WEBP" {
-        bail!(
-            "FFmpeg output is not a RIFF WebP file: {}",
-            output.display()
-        );
-    }
-
-    let riff_end = u64::from(u32::from_le_bytes(
-        riff_header[4..8]
-            .try_into()
-            .expect("RIFF size is four bytes"),
-    )) + 8;
-    if riff_end > file_length || riff_end < 12 {
-        bail!(
-            "FFmpeg produced a truncated WebP file: {}",
-            output.display()
-        );
-    }
-
-    let mut offset = 12_u64;
-    let mut total_duration_ms = 0_u64;
-    let mut last_duration = None;
-    while offset < riff_end {
-        if riff_end - offset < 8 {
-            bail!(
-                "FFmpeg produced a malformed WebP chunk table: {}",
-                output.display()
-            );
-        }
-        file.seek(SeekFrom::Start(offset))?;
-        let mut chunk_header = [0_u8; 8];
-        file.read_exact(&mut chunk_header)?;
-        let chunk_length = u64::from(u32::from_le_bytes(
-            chunk_header[4..]
-                .try_into()
-                .expect("chunk size is four bytes"),
-        ));
-        let payload_offset = offset + 8;
-        let padded_length = chunk_length
-            .checked_add(chunk_length % 2)
-            .context("WebP chunk length overflow")?;
-        let next_offset = payload_offset
-            .checked_add(padded_length)
-            .context("WebP chunk offset overflow")?;
-        if next_offset > riff_end {
-            bail!(
-                "FFmpeg produced a truncated WebP chunk: {}",
-                output.display()
-            );
-        }
-
-        if &chunk_header[..4] == b"ANMF" {
-            if chunk_length < 16 {
-                bail!(
-                    "FFmpeg produced a malformed WebP animation frame: {}",
-                    output.display()
-                );
-            }
-            let duration_offset = payload_offset + 12;
-            file.seek(SeekFrom::Start(duration_offset))?;
-            let mut duration_bytes = [0_u8; 3];
-            file.read_exact(&mut duration_bytes)?;
-            let duration_ms = u32::from(duration_bytes[0])
-                | (u32::from(duration_bytes[1]) << 8)
-                | (u32::from(duration_bytes[2]) << 16);
-            total_duration_ms += u64::from(duration_ms);
-            last_duration = Some((duration_offset, duration_ms));
-        }
-        offset = next_offset;
-    }
-
-    let Some((last_duration_offset, last_duration_ms)) = last_duration else {
-        bail!(
-            "FFmpeg output has no WebP animation frames: {}",
-            output.display()
-        );
-    };
-    let correction = i128::from(expected_duration_ms) - i128::from(total_duration_ms);
-    if correction == 0 {
-        return Ok(());
-    }
-    if correction.abs() > 1 {
-        bail!(
-            "FFmpeg produced a WebP duration of {total_duration_ms}ms; expected {expected_duration_ms}ms"
-        );
-    }
-
-    let corrected_duration = i128::from(last_duration_ms) + correction;
-    if !(0..=0xFF_FFFF).contains(&corrected_duration) {
-        bail!("corrected WebP frame duration is out of range");
-    }
-    let corrected_bytes = (corrected_duration as u32).to_le_bytes();
-    file.seek(SeekFrom::Start(last_duration_offset))?;
-    file.write_all(&corrected_bytes[..3])?;
     Ok(())
 }
 
 fn encode_gif(
     frames_directory: &Path,
-    options: &ConvertOptions,
-    frame_count: usize,
+    program: &Path,
+    arguments: &[String],
     output: &Path,
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut arguments = vec![
-        "-hide_banner".to_owned(),
-        "-y".to_owned(),
-        "-framerate".to_owned(),
-        options.fps.to_string(),
-        "-i".to_owned(),
-        "%05d.png".to_owned(),
-        "-frames:v".to_owned(),
-        frame_count.to_string(),
-    ];
-    append_gif_arguments(&mut arguments, options.quality);
-    let mut child = Command::new(&options.ffmpeg)
-        .current_dir(frames_directory)
-        .args(&arguments)
-        .arg(output)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| format!("failed to start {}", options.ffmpeg.display()))?;
+    let mut child = spawn(
+        frames_directory,
+        program,
+        arguments,
+        output,
+        Stdio::inherit(),
+    )?;
     let status = wait_for_child(&mut child, cancel, "ffmpeg")?;
     if !status.success() {
         bail!("ffmpeg exited with {status}");
@@ -338,20 +149,21 @@ fn encode_gif(
     Ok(())
 }
 
-fn append_gif_arguments(arguments: &mut Vec<String>, quality: u8) {
-    let max_colors = gif_max_colors(quality);
-    arguments.extend([
-        "-filter_complex".to_owned(),
-        format!(
-            "[0:v]split[s0][s1];[s0]palettegen=max_colors={max_colors}:stats_mode=diff[p];[s1][p]paletteuse=alpha_threshold=128"
-        ),
-        "-loop".to_owned(),
-        "0".to_owned(),
-    ]);
-}
-
-fn gif_max_colors(quality: u8) -> u16 {
-    u16::from(quality) * 224 / 100 + 32
+fn spawn(
+    frames_directory: &Path,
+    program: &Path,
+    arguments: &[String],
+    output: &Path,
+    stdout: Stdio,
+) -> Result<std::process::Child> {
+    Command::new(program)
+        .current_dir(frames_directory)
+        .args(arguments)
+        .arg(output)
+        .stdout(stdout)
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("failed to start {}", program.display()))
 }
 
 fn wait_for_child(
@@ -371,112 +183,5 @@ fn wait_for_child(
             return Ok(status);
         }
         thread::sleep(Duration::from_millis(50));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use super::{
-        append_gif_arguments, append_webp_arguments, gif_max_colors, normalize_webp_duration,
-    };
-
-    #[test]
-    fn webp_uses_ffmpeg_animation_encoder_in_lossless_mode_at_quality_100() {
-        let mut arguments = Vec::new();
-        append_webp_arguments(&mut arguments, 100, "8");
-
-        assert!(
-            arguments
-                .windows(2)
-                .any(|pair| pair == ["-c:v", "libwebp_anim"])
-        );
-        assert!(arguments.windows(2).any(|pair| pair == ["-lossless", "1"]));
-        assert!(
-            arguments
-                .windows(2)
-                .any(|pair| pair == ["-compression_level", "6"])
-        );
-        assert!(arguments.windows(2).any(|pair| pair == ["-quality", "75"]));
-        assert!(
-            arguments
-                .windows(2)
-                .any(|pair| pair == ["-pix_fmt", "bgra"])
-        );
-        assert!(arguments.windows(2).any(|pair| pair == ["-loop", "0"]));
-        assert!(arguments.windows(2).any(|pair| pair == ["-f", "webp"]));
-    }
-
-    #[test]
-    fn webp_uses_requested_lossy_quality_and_yuva_pixel_format() {
-        let mut arguments = Vec::new();
-        append_webp_arguments(&mut arguments, 0, "2");
-
-        assert!(arguments.windows(2).any(|pair| pair == ["-lossless", "0"]));
-        assert!(arguments.windows(2).any(|pair| pair == ["-quality", "0"]));
-        assert!(
-            arguments
-                .windows(2)
-                .any(|pair| pair == ["-compression_level", "5"])
-        );
-        assert!(
-            arguments
-                .windows(2)
-                .any(|pair| pair == ["-pix_fmt", "yuva420p"])
-        );
-
-        let mut quality_one_arguments = Vec::new();
-        append_webp_arguments(&mut quality_one_arguments, 1, "2");
-        assert!(
-            quality_one_arguments
-                .windows(2)
-                .any(|pair| pair == ["-quality", "1"])
-        );
-    }
-
-    #[test]
-    fn webp_duration_normalization_corrects_the_last_frame_by_one_millisecond() {
-        let temporary = tempfile::NamedTempFile::new().unwrap();
-        let mut body = b"WEBP".to_vec();
-        for duration in [16_u32, 17, 16] {
-            body.extend_from_slice(b"ANMF");
-            body.extend_from_slice(&16_u32.to_le_bytes());
-            let mut payload = [0_u8; 16];
-            payload[12..15].copy_from_slice(&duration.to_le_bytes()[..3]);
-            body.extend_from_slice(&payload);
-        }
-        let mut webp = b"RIFF".to_vec();
-        webp.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        webp.extend_from_slice(&body);
-        fs::write(temporary.path(), webp).unwrap();
-
-        normalize_webp_duration(temporary.path(), 50).unwrap();
-
-        let corrected = fs::read(temporary.path()).unwrap();
-        assert_eq!(&corrected[80..83], &[17, 0, 0]);
-    }
-
-    #[test]
-    fn gif_uses_palettegen_paletteuse_with_transparency_and_infinite_loop() {
-        let mut arguments = Vec::new();
-        append_gif_arguments(&mut arguments, 100);
-
-        let filter = arguments
-            .windows(2)
-            .find(|pair| pair[0] == "-filter_complex")
-            .map(|pair| pair[1].as_str())
-            .expect("filter_complex argument is present");
-        assert!(filter.contains("palettegen=max_colors=256"));
-        assert!(filter.contains("stats_mode=diff"));
-        assert!(filter.contains("paletteuse=alpha_threshold=128"));
-        assert!(arguments.windows(2).any(|pair| pair == ["-loop", "0"]));
-    }
-
-    #[test]
-    fn gif_max_colors_maps_quality_across_the_gif_palette() {
-        assert_eq!(gif_max_colors(0), 32);
-        assert_eq!(gif_max_colors(50), 144);
-        assert_eq!(gif_max_colors(100), 256);
     }
 }

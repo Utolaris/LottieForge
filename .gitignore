@@ -1,4 +1,5 @@
 .DS_Store
+/.workbuddy/
 /target/
 /.zig-cache/
 /zig-out/

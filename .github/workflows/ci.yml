@@ -9,6 +9,32 @@ on:
     types: [published]
 
 jobs:
+  lint-and-test:
+    name: Format, lint and unit tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install GCC for rlottie-sys
+        run: brew install gcc
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+        working-directory: tgs-convert
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        working-directory: tgs-convert
+
+      - name: Unit and integration tests
+        run: cargo test --workspace
+        working-directory: tgs-convert
+
   build-x64:
     name: Build Windows x64 binary with zig
     runs-on: macos-latest

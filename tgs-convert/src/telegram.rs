@@ -114,8 +114,7 @@ pub fn download_sticker_set(options: &TelegramDownloadOptions) -> Result<Telegra
 
     // Installed before the first request so Ctrl-C also interrupts metadata
     // fetches and the rate-limit back-off.
-    let cancel = Arc::new(AtomicBool::new(false));
-    install_cancel_handler(Arc::clone(&cancel))?;
+    let cancel = crate::cancel::install("Cancellation requested; stopping active downloads.")?;
 
     let client = Client::builder()
         .user_agent("tgs-convert Telegram sticker downloader")
@@ -578,14 +577,6 @@ fn clean_emoji(value: &str) -> String {
                 )
         })
         .collect()
-}
-
-fn install_cancel_handler(cancel: Arc<AtomicBool>) -> Result<()> {
-    ctrlc::set_handler(move || {
-        cancel.store(true, Ordering::Release);
-        eprintln!("\nCancellation requested; stopping active downloads.");
-    })
-    .map_err(|error| anyhow!("failed to install Ctrl-C handler: {error}"))
 }
 
 #[cfg(test)]

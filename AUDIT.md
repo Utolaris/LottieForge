@@ -17,9 +17,65 @@
 | V2 | ✅ 已修复 | `sanitize_file_stem()` 净化 `file_unique_id`；`download_one()` 增加落点目录断言 |
 | V3 | ✅ 已修复 | 客户端加 15s 连接 / 120s 请求超时；429 按 `Retry-After` 退避重试 2 次 |
 | V4 | ✅ 已修复 | `MAX_FRAMES` / `MAX_DIMENSION` 两个上限，在写出任何帧之前失败 |
-| C1–C7、D1–D3 已部分、D4–D7、T1、T2 | ⬜ 未处理 | — |
+| C1 | ✅ 已修复 | `main.rs` 改用 clap `Subcommand`，删掉 4 份重复 CLI 与 `nth(1)` 分发 |
+| C2 | ✅ 已修复 | 新建 `formats.rs` 统一持有格式知识，`ffmpeg.rs` 退化为只执行进程 |
+| C3 | ✅ 已修复 | 引入 `EncodeSettings`，`ConvertOptions` 不再穿透到编码器 |
+| C4 | ✅ 已修复 | `FrameWorker` + `LoadedAnimation::new_renderer`，删掉全仓唯一 clippy 抑制 |
+| C5 | ✅ 已修复 | `timeline()` 一处同时算出帧数与时长 |
+| C6 | ✅ 已修复 | 抽 `cancel.rs`；父目录助手统一为 `parent_directory()` |
+| C7 | ✅ 已修复 | 纯像素变换拆到 `transform.rs` |
+| D1 | ✅ 已修复 | `output_parent` 去掉永不失败的 `Result` |
+| D2 | ✅ 已修复 | 边界常量单点定义，clap 与 `validate()` 共用 |
+| D3 | ✅ 已修复 | 删掉不可能的溢出守卫，额度换成真实上限 |
+| D4 | ✅ 已修复 | WebP 时长偏差降级为警告，不再丢弃成品文件 |
+| D5 | ✅ 已修复 | `expect` 换成 `poisoned.into_inner()` / `context` |
+| D6 | ✅ 已修复 | `RenderProgress` 双原子 + CAS 简化为单原子百分比判断 |
+| T1 | ✅ 已修复 | CI 新增 `lint-and-test` job |
+| T2 | ✅ 已修复 | 新增 `tests/cli.rs`，5 个 `.tgs` 与 JSON 夹具全部投入使用 |
+| D7 | ⬜ 未处理 | NUL 字节全量扫描——有实际理由（rlottie 是 C API），改动收益低，保留 |
 
-改动落在 `tgs-convert/src/telegram.rs`、`lib.rs`、`render.rs`、`options.rs`（无新增依赖）。校验：`cargo fmt --all --check` 通过、`cargo clippy --workspace --all-targets -- -D warnings` 通过、`cargo test` **25 passed**（原 18，新增 7 个）。
+第一批改动落在 `telegram.rs`、`lib.rs`、`render.rs`、`options.rs`。
+
+## 第二批：架构收敛与工程化
+
+新增 `src/formats.rs`、`src/transform.rs`、`src/cancel.rs`，`ffmpeg.rs` 从 482 行降到 191 行，`main.rs` 从 249 行降到 216 行（并删掉约 120 行重复内容）。无新增依赖。
+
+校验：`cargo fmt --all --check` 通过、`cargo clippy --workspace --all-targets -- -D warnings` 通过、`cargo test` **33 passed**（单元 29 + 集成 4，原为 18 个单元测试且无集成测试）。
+
+### C1 的一处意外：clap 4.6 不支持「必填位置参数 + 可选子命令」
+
+原计划用 `subcommand_negates_reqs = true` 让顶层 `<INPUT>` 在出现子命令时不再必填，这也是 clap 文档给出的写法。但实测在 clap 4.6.5 下**不生效**：
+
+```
+$ tgs-convert mov file.tgs -o out.mov --fps 5
+error: the following required argument was not provided: input
+
+Usage: tgs-convert [OPTIONS] <INPUT>
+       tgs-convert [OPTIONS] [INPUT] <COMMAND>
+```
+
+对照 `mov --fps 5`（子命令自身缺参）报的是子命令的用法，说明 `mov` 确实被当作子命令解析了；但只要子命令解析成功，父级仍会校验自己的 `input`——即 `has_subcmd` 在父级校验时并未生效。交换字段顺序、去掉 `args_conflicts_with_subcommands` 都不影响。
+
+**采用的结构**：顶层 `DefaultConversion.input` 为 `Option<PathBuf>`（仅此一处可选，换到 `into_conversion()` 里检查），子命令里的 `ConversionArgs.input` 保持必填，因此 `tgs-convert mov --fps 5` 这类误用仍由 clap 给出带用法的标准报错。共享选项抽到 `SharedConversionOptions`，三个结构体之间没有重复字段。
+
+同时用 `propagate_version = true` 修掉了原来的 `tgs-convert gif 0.1.0`（版本号里带空格）：现在输出 `tgs-convert-gif 0.1.0`。
+
+### C2 的收益：枚举穷尽性回来了
+
+`ffmpeg.rs:100` 原先的 `unreachable!("GIF is encoded by encode_gif before FFmpeg arguments are built")` 之所以存在，是因为 GIF 用提前 return 绕开了那个 `match`——代价是编译器不再检查穷尽性，新增格式会静默走到死分支。现在 `OutputFormat::plan()` 是穷尽的，`encode()` 的 `match` 也是穷尽的，新增格式不给参数就编译不过；`formats::tests::every_format_produces_a_plan` 会遍历全部变体。
+
+### 端到端回归
+
+```
+子命令 mov / webp / gif   → 均成功
+裸形态（默认 WebM）        → 成功
+文件名为 mov 的输入        → 成功（修复前会被误判为子命令）
+--help                    → 列出全部子命令（修复前一个都不显示）
+--version / gif --version → tgs-convert 0.1.0 / tgs-convert-gif 0.1.0
+顶层选项 + 子命令混用      → 报错而非静默忽略
+```
+
+集成测试 `tests/cli.rs` 覆盖：5 个 `.tgs` 与 2 个 JSON 夹具全部可加载；gzip 与明文 JSON 解析结果一致；有 FFmpeg 时跑通 4 种格式并断言临时帧目录无残留。
 
 ### V1 端到端验证
 

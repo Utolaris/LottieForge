@@ -1,23 +1,25 @@
+mod cancel;
 mod ffmpeg;
+mod formats;
 mod options;
 mod render;
 pub mod telegram;
+mod transform;
 
 use std::{
     fs,
     path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use tempfile::Builder;
 
+pub use formats::OutputFormat;
 use options::MAX_DIMENSION;
-pub use options::{ConvertOptions, OutputFormat};
-use render::{RenderSettings, load_animation, render_sequence};
+pub use options::{ConvertOptions, FPS_MAX, FPS_MIN, QUALITY_MAX};
+pub use render::{AnimationMetadata, LoadedAnimation, load_animation};
+use render::{RenderSettings, render_sequence, timeline};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ConversionReport {
@@ -29,13 +31,12 @@ pub struct ConversionReport {
 
 pub fn convert(options: &ConvertOptions) -> Result<ConversionReport> {
     options.validate()?;
-    let output_parent = output_parent(&options.output)?;
+    let output_parent = parent_directory(&options.output);
     fs::create_dir_all(output_parent)
         .with_context(|| format!("failed to create {}", output_parent.display()))?;
     let absolute_output = absolute_output_path(&options.output)?;
 
-    let cancel = Arc::new(AtomicBool::new(false));
-    install_cancel_handler(Arc::clone(&cancel))?;
+    let cancel = cancel::install("Cancellation requested; stopping after the active frame.")?;
     let animation = load_animation(&options.input)?;
     let (width, height) = resolve_output_size(
         options.width,
@@ -53,21 +54,27 @@ pub fn convert(options: &ConvertOptions) -> Result<ConversionReport> {
         flip_vertical: options.flip_vertical,
         threads: options.threads,
     };
-    let duration_seconds = animation.metadata.duration_seconds / options.play_speed;
+    let timeline = timeline(
+        animation.metadata.duration_seconds,
+        options.play_speed,
+        options.fps,
+    )?;
     let temporary_directory = Builder::new()
         .prefix("tgs-frames-")
         .tempdir_in(output_parent)
         .context("failed to create temporary frame directory")?;
 
     eprintln!(
-        "Rendering {} at {width}x{height}, {} fps, {} worker(s)",
+        "Rendering {} at {width}x{height}, {} fps, {} worker(s), {} frames",
         options.input.display(),
         options.fps,
-        options.threads
+        options.threads,
+        timeline.frames
     );
     let frames = render_sequence(
         &animation,
         render_settings,
+        timeline,
         temporary_directory.path(),
         Arc::clone(&cancel),
     )?;
@@ -82,8 +89,10 @@ pub fn convert(options: &ConvertOptions) -> Result<ConversionReport> {
     );
     ffmpeg::encode(
         temporary_directory.path(),
-        options,
-        frames,
+        &options.ffmpeg,
+        &options
+            .output_format
+            .plan(&options.encode_settings(timeline.frames)),
         &absolute_output,
         Arc::clone(&cancel),
     )?;
@@ -92,23 +101,15 @@ pub fn convert(options: &ConvertOptions) -> Result<ConversionReport> {
         width,
         height,
         frames,
-        duration_seconds,
+        duration_seconds: timeline.duration_seconds,
     })
 }
 
-fn install_cancel_handler(cancel: Arc<AtomicBool>) -> Result<()> {
-    ctrlc::set_handler(move || {
-        cancel.store(true, Ordering::Release);
-        eprintln!("\nCancellation requested; stopping after the active frame.");
-    })
-    .map_err(|error| anyhow!("failed to install Ctrl-C handler: {error}"))
-}
-
-fn output_parent(output: &Path) -> Result<&Path> {
-    Ok(output
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new(".")))
+/// The directory holding `path`, falling back to the working directory.
+pub(crate) fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 fn absolute_output_path(output: &Path) -> Result<std::path::PathBuf> {
