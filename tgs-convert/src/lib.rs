@@ -15,6 +15,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use tempfile::Builder;
 
+use options::MAX_DIMENSION;
 pub use options::{ConvertOptions, OutputFormat};
 use render::{RenderSettings, load_animation, render_sequence};
 
@@ -126,18 +127,25 @@ fn resolve_output_size(
     intrinsic_width: usize,
     intrinsic_height: usize,
 ) -> Result<(usize, usize)> {
-    match (requested_width, requested_height) {
-        (Some(width), Some(height)) => Ok((width, height)),
+    let (width, height) = match (requested_width, requested_height) {
+        (Some(width), Some(height)) => (width, height),
         (Some(width), None) => {
             let height = scale_dimension(intrinsic_height, width, intrinsic_width)?;
-            Ok((width, height))
+            (width, height)
         }
         (None, Some(height)) => {
             let width = scale_dimension(intrinsic_width, height, intrinsic_height)?;
-            Ok((width, height))
+            (width, height)
         }
-        (None, None) => Ok((intrinsic_width, intrinsic_height)),
+        (None, None) => (intrinsic_width, intrinsic_height),
+    };
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        bail!(
+            "output size {width}x{height} exceeds the {MAX_DIMENSION}px per-side limit; \
+             lower --width / --height"
+        );
     }
+    Ok((width, height))
 }
 
 fn scale_dimension(source: usize, target_other: usize, source_other: usize) -> Result<usize> {
@@ -154,7 +162,20 @@ fn scale_dimension(source: usize, target_other: usize, source_other: usize) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_output_size;
+    use super::{MAX_DIMENSION, resolve_output_size};
+
+    #[test]
+    fn output_size_is_capped_on_either_side() {
+        assert!(resolve_output_size(Some(MAX_DIMENSION + 1), None, 512, 384).is_err());
+        assert!(resolve_output_size(None, Some(MAX_DIMENSION + 1), 512, 384).is_err());
+        // The side scaled from the aspect ratio is capped too.
+        assert!(resolve_output_size(Some(MAX_DIMENSION), None, 1, 10_000).is_err());
+        // Exactly at the limit is still accepted.
+        assert_eq!(
+            resolve_output_size(Some(MAX_DIMENSION), None, 512, 384).unwrap(),
+            (MAX_DIMENSION, 3072)
+        );
+    }
 
     #[test]
     fn single_width_preserves_aspect_ratio() {

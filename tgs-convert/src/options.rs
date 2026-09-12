@@ -2,6 +2,22 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 
+/// Upper bound on either output dimension.
+///
+/// Bounds the per-worker frame buffer and the per-frame PNG, and covers both
+/// explicitly requested sizes and the side scaled from the aspect ratio.
+pub const MAX_DIMENSION: usize = 4096;
+
+/// Upper bound on the number of rendered frames.
+///
+/// Every frame is written to a temporary directory before FFmpeg reads it, so
+/// this is what stops an untrusted Lottie (`.tgs` files are downloaded from
+/// Telegram) from filling the disk. The animation duration is self-reported by
+/// the file via `(op - ip) / fr` and is not otherwise constrained.
+///
+/// Roughly 5.5 minutes at 60 fps, or 1.4 minutes at the 240 fps ceiling.
+pub const MAX_FRAMES: usize = 20_000;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputFormat {
     WebmVp9,

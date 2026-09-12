@@ -6,6 +6,8 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -16,12 +18,35 @@ const TOKEN_SERVICE: &str = "TGSConvert";
 const TOKEN_ACCOUNT: &str = "tgs-convert";
 const API_BASE: &str = "https://api.telegram.org";
 
-#[derive(Clone, Debug)]
+/// Stands in for a bot token in any message that could reach a log.
+const REDACTED: &str = "<redacted>";
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_RATE_LIMIT_RETRIES: u32 = 2;
+const MAX_RETRY_AFTER_SECONDS: u64 = 60;
+const MAX_FILE_STEM_LENGTH: usize = 64;
+
+#[derive(Clone)]
 pub struct TelegramDownloadOptions {
     pub link_or_name: String,
     pub output_directory: PathBuf,
     pub threads: usize,
     pub token: String,
+}
+
+impl std::fmt::Debug for TelegramDownloadOptions {
+    /// Hand-written so the bot token can never be printed by an accidental
+    /// `{:?}` on the options struct.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TelegramDownloadOptions")
+            .field("link_or_name", &self.link_or_name)
+            .field("output_directory", &self.output_directory)
+            .field("threads", &self.threads)
+            .field("token", &REDACTED)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -87,11 +112,18 @@ pub fn download_sticker_set(options: &TelegramDownloadOptions) -> Result<Telegra
         )
     })?;
 
+    // Installed before the first request so Ctrl-C also interrupts metadata
+    // fetches and the rate-limit back-off.
+    let cancel = Arc::new(AtomicBool::new(false));
+    install_cancel_handler(Arc::clone(&cancel))?;
+
     let client = Client::builder()
         .user_agent("tgs-convert Telegram sticker downloader")
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
         .build()
         .context("failed to create Telegram HTTP client")?;
-    let set = get_sticker_set(&client, &options.token, &requested_name)?;
+    let set = get_sticker_set(&client, &options.token, &requested_name, &cancel)?;
     if set.stickers.is_empty() {
         bail!("Telegram sticker set {} is empty", set.name);
     }
@@ -110,8 +142,6 @@ pub fn download_sticker_set(options: &TelegramDownloadOptions) -> Result<Telegra
         .collect::<Vec<_>>();
     let file_count = items.len();
     let workers = options.threads.min(file_count);
-    let cancel = Arc::new(AtomicBool::new(false));
-    install_cancel_handler(Arc::clone(&cancel))?;
     let next_index = AtomicUsize::new(0);
     let completed = AtomicUsize::new(0);
     let first_error = Mutex::new(None::<String>);
@@ -142,7 +172,7 @@ pub fn download_sticker_set(options: &TelegramDownloadOptions) -> Result<Telegra
                     }
 
                     if let Err(error) =
-                        download_one(&client, token, &items[index], output_directory)
+                        download_one(&client, token, &items[index], output_directory, &cancel)
                     {
                         cancel.store(true, Ordering::Release);
                         let mut slot = first_error.lock().expect("download error mutex poisoned");
@@ -303,13 +333,23 @@ pub fn parse_sticker_set_name(link_or_name: &str) -> Result<String> {
     Ok(candidate.to_owned())
 }
 
-fn get_sticker_set(client: &Client, token: &str, name: &str) -> Result<StickerSet> {
-    telegram_api(client, token, "getStickerSet", [("name", name)])
+fn get_sticker_set(
+    client: &Client,
+    token: &str,
+    name: &str,
+    cancel: &AtomicBool,
+) -> Result<StickerSet> {
+    telegram_api(client, token, "getStickerSet", &[("name", name)], cancel)
         .with_context(|| format!("failed to fetch Telegram sticker set {name}"))
 }
 
-fn get_file(client: &Client, token: &str, file_id: &str) -> Result<TelegramFile> {
-    telegram_api(client, token, "getFile", [("file_id", file_id)])
+fn get_file(
+    client: &Client,
+    token: &str,
+    file_id: &str,
+    cancel: &AtomicBool,
+) -> Result<TelegramFile> {
+    telegram_api(client, token, "getFile", &[("file_id", file_id)], cancel)
         .context("failed to fetch Telegram file metadata")
 }
 
@@ -317,22 +357,27 @@ fn telegram_api<T>(
     client: &Client,
     token: &str,
     method: &str,
-    query: [(&str, &str); 1],
+    query: &[(&str, &str)],
+    cancel: &AtomicBool,
 ) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
     let url = format!("{API_BASE}/bot{token}/{method}");
-    let response = client
-        .get(url)
-        .query(&query)
-        .send()
-        .with_context(|| format!("Telegram API request {method} failed"))?
+    let response = send_with_retry(client, &url, query, token, method, cancel)?
         .error_for_status()
-        .with_context(|| format!("Telegram API request {method} returned an HTTP error"))?;
-    let response = response
-        .json::<ApiResponse<T>>()
-        .with_context(|| format!("Telegram API request {method} returned invalid JSON"))?;
+        .map_err(|error| {
+            anyhow!(
+                "Telegram API request {method} returned an HTTP error: {}",
+                redacted_error(&error, token)
+            )
+        })?;
+    let response = response.json::<ApiResponse<T>>().map_err(|error| {
+        anyhow!(
+            "Telegram API request {method} returned invalid JSON: {}",
+            redacted_error(&error, token)
+        )
+    })?;
     if !response.ok {
         bail!(
             "Telegram API request {method} was rejected: {}",
@@ -346,26 +391,128 @@ where
         .ok_or_else(|| anyhow!("Telegram API request {method} returned no result"))
 }
 
+/// Sends one GET request, retrying a bounded number of times when Telegram
+/// reports rate limiting.
+fn send_with_retry(
+    client: &Client,
+    url: &str,
+    query: &[(&str, &str)],
+    token: &str,
+    method: &str,
+    cancel: &AtomicBool,
+) -> Result<reqwest::blocking::Response> {
+    let mut attempt = 0_u32;
+    loop {
+        let response = client.get(url).query(query).send().map_err(|error| {
+            anyhow!(
+                "Telegram request {method} failed: {}",
+                redacted_error(&error, token)
+            )
+        })?;
+
+        if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Ok(response);
+        }
+
+        let retry_after = retry_after_seconds(&response);
+        if attempt >= MAX_RATE_LIMIT_RETRIES {
+            bail!(
+                "Telegram rate limited {method}; gave up after {MAX_RATE_LIMIT_RETRIES} retries \
+                 (the server asked to wait {retry_after}s)"
+            );
+        }
+        attempt += 1;
+        eprintln!(
+            "Telegram rate limited {method}; retrying in {retry_after}s \
+             ({attempt}/{MAX_RATE_LIMIT_RETRIES})"
+        );
+        if !sleep_until_cancelled(Duration::from_secs(retry_after), cancel) {
+            bail!("download cancelled");
+        }
+    }
+}
+
+fn retry_after_seconds(response: &reqwest::blocking::Response) -> u64 {
+    response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(1)
+        .min(MAX_RETRY_AFTER_SECONDS)
+}
+
+/// Sleeps in short slices so Ctrl-C is honoured during the back-off.
+///
+/// Returns `false` when the download was cancelled.
+fn sleep_until_cancelled(duration: Duration, cancel: &AtomicBool) -> bool {
+    let deadline = Instant::now() + duration;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(200)));
+    }
+}
+
+/// Removes the bot token from a message before it can reach a log.
+///
+/// `reqwest` appends the request URL to its error messages, and the token is
+/// part of that URL's path, so **every** error derived from a request has to
+/// pass through here — including the ones only reachable through `{:#}`.
+fn sanitize_token(message: &str, token: &str) -> String {
+    if token.is_empty() {
+        return message.to_owned();
+    }
+    message.replace(token, REDACTED)
+}
+
+/// Renders `error` and its whole source chain the way anyhow's `{:#}` would,
+/// with the token removed at every level.
+fn redacted_error(error: &dyn std::error::Error, token: &str) -> String {
+    let mut message = sanitize_token(&error.to_string(), token);
+    let mut source = error.source();
+    while let Some(current) = source {
+        message.push_str(": ");
+        message.push_str(&sanitize_token(&current.to_string(), token));
+        source = current.source();
+    }
+    message
+}
+
 fn download_one(
     client: &Client,
     token: &str,
     item: &DownloadItem,
     output_directory: &Path,
+    cancel: &AtomicBool,
 ) -> Result<()> {
-    let metadata = get_file(client, token, &item.file_id)?;
+    let metadata = get_file(client, token, &item.file_id, cancel)?;
     let extension =
         extension_from_path(&metadata.file_path).unwrap_or_else(|| fallback_extension(item));
     let filename = filename(item, extension);
     let destination = output_directory.join(filename);
+    if destination.parent() != Some(output_directory) {
+        bail!(
+            "refusing to write outside the output directory: {}",
+            destination.display()
+        );
+    }
     let partial_destination = destination.with_extension(format!("{extension}.part"));
     let url = format!("{API_BASE}/file/bot{token}/{}", metadata.file_path);
 
-    let mut response = client
-        .get(url)
-        .send()
-        .context("Telegram file download request failed")?
+    let mut response = send_with_retry(client, &url, &[], token, "file download", cancel)?
         .error_for_status()
-        .context("Telegram file download returned an HTTP error")?;
+        .map_err(|error| {
+            anyhow!(
+                "Telegram file download returned an HTTP error: {}",
+                redacted_error(&error, token)
+            )
+        })?;
     let mut partial = File::create(&partial_destination)
         .with_context(|| format!("failed to create {}", partial_destination.display()))?;
     io::copy(&mut response, &mut partial)
@@ -394,12 +541,29 @@ fn fallback_extension(item: &DownloadItem) -> &'static str {
 
 fn filename(item: &DownloadItem, extension: &str) -> String {
     let emoji = item.emoji.as_deref().map(clean_emoji).unwrap_or_default();
+    let unique = sanitize_file_stem(&item.unique_id);
     let stem = if emoji.is_empty() {
-        item.unique_id.clone()
+        unique
     } else {
-        format!("{emoji}_{}", item.unique_id)
+        format!("{emoji}_{unique}")
     };
     format!("{stem}.{extension}")
+}
+
+/// Telegram returns `file_unique_id` as an opaque string. Only characters that
+/// are safe inside a file name are kept, so a hostile response cannot escape
+/// the output directory with a `..` segment or an absolute path.
+fn sanitize_file_stem(value: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        .take(MAX_FILE_STEM_LENGTH)
+        .collect();
+    if cleaned.is_empty() {
+        "sticker".to_owned()
+    } else {
+        cleaned
+    }
 }
 
 fn clean_emoji(value: &str) -> String {
@@ -426,7 +590,14 @@ fn install_cancel_handler(cancel: Arc<AtomicBool>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DownloadItem, clean_emoji, filename, parse_sticker_set_name};
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        DownloadItem, TelegramDownloadOptions, clean_emoji, filename, parse_sticker_set_name,
+        redacted_error, sanitize_file_stem, sanitize_token,
+    };
+
+    const SAMPLE_TOKEN: &str = "7654321:AAHfakeTokenValueDoNotUse";
 
     #[test]
     fn parses_sticker_and_emoji_links() {
@@ -457,5 +628,101 @@ mod tests {
         };
         assert_eq!(filename(&item, "tgs"), "😀_unique.tgs");
         assert_eq!(clean_emoji("a/b"), "ab");
+    }
+
+    #[test]
+    fn unique_id_cannot_escape_the_output_directory() {
+        let item = DownloadItem {
+            file_id: "unused".to_owned(),
+            unique_id: "../../etc/passwd".to_owned(),
+            emoji: None,
+            is_animated: true,
+            is_video: false,
+        };
+        let name = filename(&item, "tgs");
+        assert_eq!(name, "etcpasswd.tgs");
+        assert_eq!(Path::new(&name).components().count(), 1);
+    }
+
+    #[test]
+    fn sanitize_file_stem_keeps_the_telegram_alphabet() {
+        assert_eq!(sanitize_file_stem("AgADGAADwDZPEw"), "AgADGAADwDZPEw");
+        assert_eq!(sanitize_file_stem("a-b_c"), "a-b_c");
+        assert_eq!(sanitize_file_stem(""), "sticker");
+        assert_eq!(sanitize_file_stem("../.."), "sticker");
+        assert_eq!(sanitize_file_stem("/etc/passwd"), "etcpasswd");
+        assert_eq!(sanitize_file_stem(&"a".repeat(200)).len(), 64);
+    }
+
+    #[test]
+    fn bot_tokens_are_removed_from_error_text() {
+        let message = format!(
+            "error sending request for url (https://api.telegram.org/bot{SAMPLE_TOKEN}/getMe)"
+        );
+        let sanitized = sanitize_token(&message, SAMPLE_TOKEN);
+        assert!(!sanitized.contains(SAMPLE_TOKEN));
+        assert!(sanitized.contains("<redacted>"));
+    }
+
+    #[test]
+    fn redacted_error_keeps_the_cause_chain_without_the_token() {
+        let deepest = ChainError::new("tls handshake eof".to_owned(), None);
+        let middle = ChainError::new("client error (Connect)".to_owned(), Some(deepest));
+        let top = ChainError::new(
+            format!(
+                "error sending request for url (https://api.telegram.org/bot{SAMPLE_TOKEN}/getMe)"
+            ),
+            Some(middle),
+        );
+
+        let rendered = redacted_error(&top, SAMPLE_TOKEN);
+        assert!(!rendered.contains(SAMPLE_TOKEN));
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("client error (Connect)"));
+        assert!(rendered.contains("tls handshake eof"));
+    }
+
+    #[test]
+    fn options_debug_redacts_the_token() {
+        let options = TelegramDownloadOptions {
+            link_or_name: "HotCherry".to_owned(),
+            output_directory: PathBuf::from("out"),
+            threads: 2,
+            token: SAMPLE_TOKEN.to_owned(),
+        };
+        let rendered = format!("{options:?}");
+        assert!(!rendered.contains(SAMPLE_TOKEN));
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("HotCherry"));
+    }
+
+    #[derive(Debug)]
+    struct ChainError {
+        message: String,
+        source: Option<Box<ChainError>>,
+    }
+
+    impl ChainError {
+        fn new(message: String, source: Option<Self>) -> Self {
+            Self {
+                message,
+                source: source.map(Box::new),
+            }
+        }
+    }
+
+    impl std::fmt::Display for ChainError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for ChainError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match &self.source {
+                Some(inner) => Some(inner.as_ref()),
+                None => None,
+            }
+        }
     }
 }

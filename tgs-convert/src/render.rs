@@ -9,6 +9,7 @@ use std::{
     thread,
 };
 
+use crate::options::MAX_FRAMES;
 use anyhow::{Context, Result, anyhow, bail};
 use flate2::read::GzDecoder;
 use rlottie::{Animation, Size, Surface};
@@ -47,8 +48,15 @@ impl RenderSettings {
         }
 
         let frames = (duration * f64::from(self.fps)).ceil();
-        if !frames.is_finite() || frames > usize::MAX as f64 {
-            bail!("requested output frame count is out of range");
+        if !frames.is_finite() {
+            bail!("the animation is too long to render");
+        }
+        if frames > MAX_FRAMES as f64 {
+            bail!(
+                "this animation needs {frames:.0} frames at {fps} fps, which exceeds the \
+                 {MAX_FRAMES} frame limit; raise --play-speed or lower --fps",
+                fps = self.fps,
+            );
         }
         Ok(frames as usize)
     }
@@ -424,6 +432,35 @@ mod tests {
             threads: 1,
         };
         assert_eq!(settings.output_frame_count(3.0).unwrap(), 360);
+    }
+
+    #[test]
+    fn output_frame_count_rejects_animations_beyond_the_frame_limit() {
+        let settings = RenderSettings {
+            fps: 60,
+            play_speed: 1.0,
+            width: 2,
+            height: 2,
+            rotation_degrees: 0.0,
+            flip_horizontal: false,
+            flip_vertical: false,
+            threads: 1,
+        };
+        // A hostile Lottie can self-report any duration it likes.
+        let error = settings
+            .output_frame_count(10_000.0)
+            .expect_err("a 10,000 second animation must be rejected")
+            .to_string();
+        assert!(error.contains("frame limit"), "{error}");
+        assert!(error.contains("600000"), "{error}");
+
+        // A much slower play speed stretches the same animation back over the limit.
+        let stretched = RenderSettings {
+            play_speed: 0.1,
+            ..settings
+        };
+        assert!(stretched.output_frame_count(100.0).is_err());
+        assert_eq!(settings.output_frame_count(3.0).unwrap(), 180);
     }
 
     #[test]
